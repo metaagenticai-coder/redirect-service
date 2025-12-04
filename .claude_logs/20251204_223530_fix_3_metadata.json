@@ -1,0 +1,12 @@
+{
+  "timestamp": "20251204_223530",
+  "execution_type": "fix",
+  "model": "claude-sonnet-4-5-20250929",
+  "returncode": 0,
+  "success": true,
+  "prompt_file": "20251204_223530_fix_3_prompt.txt",
+  "output_file": "20251204_223530_fix_3_output.txt",
+  "error_file": null,
+  "output_size": 1733,
+  "error_size": 0
+}
