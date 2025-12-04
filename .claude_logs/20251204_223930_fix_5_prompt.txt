@@ -1,0 +1,129 @@
+# Fix Code Review Issues
+
+## Original Task
+# Task: Setup redirect-service repository structure
+
+## Metadata
+- slug: repo-setup
+- type: repo-setup
+
+## Goal
+
+Initialize the redirect-service repository with proper Go module configuration, directory structure, and essential configuration files for a production-ready microservice.
+
+## Dependencies
+
+None - this is the first task
+
+## Context
+
+- Service Doc: `services/redirect-service.md`
+- Architecture: `architecture/architecture.md`
+
+## Review Findings
+
+**Severity**: MAJOR
+
+**Issues Identified:**
+- A 6.8MB compiled binary `redirect-service` was committed to the repository (visible in commit a83b6e3)
+- This violates standard Git best practices and significantly bloats the repository
+- The `.gitignore` file only ignores `bin/` directory but not the binary in the root
+- **Location**: `/redirect-service` (root directory)
+- **Fix Required**: Add `redirect-service` to `.gitignore` and remove from git history
+- All dependencies (chi, pgx, redis, zap, prometheus) are marked as `// indirect`
+- These dependencies are not actually imported in `main.go` yet
+- When I ran `go mod tidy`, all dependencies were removed because none are used
+- **Issue**: This creates misleading dependency information suggesting the project uses these libraries when it doesn't
+- **Fix Required**: Either:
+- Remove unused dependencies from go.mod (if waiting for future implementation), OR
+- Import them in the code with placeholder/skeleton implementations
+- The Dockerfile uses a `scratch` base image without setting a non-root user
+- While `scratch` images run as root by default, this is a security best practice
+- Cloud Run will run containers as non-root by default anyway, but it's better to be explicit
+- **Recommendation**: Consider adding a user in the final stage
+- Health endpoint returns `"version":"1.0.0"` per spec but this is hardcoded
+- Should use build-time ldflags to inject version from git tags
+- **Minor issue**: Not blocking for initial setup
+- Contains `PROJECT_ID` placeholder that needs to be replaced
+- This is expected for a template, but should be documented in README
+- **Recommendation**: Add note in README about replacing PROJECT_ID
+
+**Recommendations:**
+### Required Changes (Must Fix):
+
+1. **Fix .gitignore and remove binary**:
+   ```bash
+   # Add to .gitignore
+   echo "redirect-service" >> .gitignore
+   
+   # Remove from repository
+   git rm --cached redirect-service
+   git commit -m "Remove committed binary from repository"
+   ```
+
+2. **Fix go.mod dependencies**:
+   
+   **Option A** (Recommended for this setup task): Remove unused dependencies
+   ```bash
+   go mod tidy
+   git add go.mod go.sum
+   git commit -m "Remove unused dependencies from go.mod"
+   ```
+   
+   **Option B**: Add comment in main.go explaining why dependencies are pre-declared
+   ```go
+   // Pre-declared dependencies for future implementation tasks:
+   // - github.com/go-chi/chi/v5 - HTTP routing
+   // - github.com/jackc/pgx/v5 - PostgreSQL driver
+   // - github.com/redis/go-redis/v9 - Redis client
+   // - go.uber.org/zap - Structured logging
+   // - github.com/prometheus/client_golang - Metrics
+   ```
+
+### Optional Improvements:
+
+3. **Add build version injection**:
+   Update Makefile build command:
+   ```makefile
+   build:
+       go build -ldflags="-X main.version=$(git describe --tags --always)" \
+         -o bin/$(SERVICE_NAME) ./cmd/$(SERVICE_NAME)
+   ```
+
+4. **Document PROJECT_ID replacement** in README:
+   ```markdown
+   ## Deployment
+   
+   Before deploying, replace `PROJECT_ID` in `deployments/cloudrun.yaml` with your GCP project ID.
+   ```
+
+5. **Add health check test**:
+   Create basic smoke test to verify the service starts and health endpoints respond.
+
+## ASSESSMENT:
+
+The repository structure is **well-organized** and follows Go best practices with clear separation of concerns (`cmd/`, `internal/`, `pkg/`). The Dockerfile uses multi-stage builds appropriately, and the Cloud Run configuration matches the service specification precisely.
+
+However, the **two MAJOR issues** (committed binary and incorrect dependency declarations) must be fixed before this can be considered complete:
+
+1. The committed binary violates repository hygiene standards
+2. The go.mod file is misleading about actual dependencies
+
+**Once these issues are resolved**, the repository setup will be complete and ready for the next implementation tasks.
+
+---
+
+**Action Required**: Fix the two MAJOR issues listed above before proceeding to the next task.
+
+---
+
+# Instructions
+
+Please fix the issues identified in the code review above. Make the necessary changes to address all major issues while maintaining the core functionality. Ensure the code:
+
+1. Addresses all identified issues
+2. Maintains correct functionality
+3. Follows best practices
+4. Passes all tests
+
+Make only the necessary changes to fix the issues - do not refactor unrelated code.
