@@ -39,6 +39,7 @@ Thumbs.db
 bin/
 dist/
 build/
+redirect-service
 
 # Logs
 *.log
