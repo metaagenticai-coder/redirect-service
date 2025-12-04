@@ -1,0 +1,1983 @@
+# Code Review Request
+
+## Task Context
+# Task: Setup redirect-service repository structure
+
+## Metadata
+- slug: repo-setup
+- type: repo-setup
+
+## Goal
+
+Initialize the redirect-service repository with proper Go module configuration, directory structure, and essential configuration files for a production-ready microservice.
+
+## Dependencies
+
+None - this is the first task
+
+## Context
+
+- Service Doc: `services/redirect-service.md`
+- Architecture: `architecture/architecture.md`
+
+## Service Specification
+# Service Specification: redirect-service
+
+## Overview
+
+The `redirect-service` is a high-performance URL redirect service optimized for ultra-low latency. It accepts HTTP requests containing short codes and performs HTTP 301 redirects to the original long URLs. The service prioritizes read performance through aggressive caching strategies, utilizing Redis as the primary data source with PostgreSQL read replicas as fallback. It is designed to handle 10,000+ requests per second with p99 latency under 50ms.
+
+**Key Characteristics:**
+- Read-optimized microservice (no write operations)
+- Cache-first architecture with >95% cache hit rate target
+- Horizontally scalable via Cloud Run
+- Higher availability priority than shortening service
+- Minimal resource footprint (256Mi memory, 1 vCPU)
+
+---
+
+## Tech Stack
+
+- **Language:** Go 1.21+
+- **Framework:** Chi v5 (lightweight HTTP router with minimal overhead)
+- **Primary Data Source:** Redis 7.0 (Memorystore)
+- **Fallback Data Source:** PostgreSQL 15 (Cloud SQL Read Replica)
+- **Container Runtime:** Cloud Run
+- **Observability:** Cloud Logging, Cloud Monitoring, Cloud Trace
+- **Libraries:**
+  - `github.com/go-chi/chi/v5` - HTTP routing
+  - `github.com/go-redis/redis/v9` - Redis client with pipelining support
+  - `github.com/jackc/pgx/v5` - High-performance PostgreSQL driver
+  - `go.uber.org/zap` - Structured logging
+  - `github.com/prometheus/client_golang` - Metrics instrumentation
+
+---
+
+## APIs/Interfaces
+
+### GET /{shortCode}
+
+**Description:** Redirects the user to the original long URL associated with the provided short code. This is the primary endpoint and handles 99%+ of all traffic to this service.
+
+**Path Parameters:**
+- `shortCode` (string, required): 6-8 character alphanumeric identifier (base62 encoded)
+
+**Request:**
+```http
+GET /aB3xY9 HTTP/1.1
+Host: short.link
+User-Agent: Mozilla/5.0
+Accept: text/html
+```
+
+**Response (301 Moved Permanently):**
+```http
+HTTP/1.1 301 Moved Permanently
+Location: https://example.com/very/long/url/path?query=params
+Cache-Control: public, max-age=300
+X-Request-ID: req-abc123xyz
+X-Cache-Status: HIT
+Content-Length: 0
+```
+
+**Response (404 Not Found):**
+```http
+HTTP/1.1 404 Not Found
+Content-Type: application/json
+X-Request-ID: req-abc123xyz
+X-Cache-Status: MISS
+
+{
+  "error": "not_found",
+  "message": "Short code not found",
+  "short_code": "invalid1"
+}
+```
+
+**Response (400 Bad Request):**
+```http
+HTTP/1.1 400 Bad Request
+Content-Type: application/json
+X-Request-ID: req-abc123xyz
+
+{
+  "error": "invalid_short_code",
+  "message": "Short code must be 6-8 alphanumeric characters",
+  "short_code": "ab@#$"
+}
+```
+
+**Response (500 Internal Server Error):**
+```http
+HTTP/1.1 500 Internal Server Error
+Content-Type: application/json
+X-Request-ID: req-abc123xyz
+
+{
+  "error": "internal_error",
+  "message": "Unable to process redirect request",
+  "request_id": "req-abc123xyz"
+}
+```
+
+**Response (503 Service Unavailable):**
+```http
+HTTP/1.1 503 Service Unavailable
+Content-Type: application/json
+Retry-After: 30
+X-Request-ID: req-abc123xyz
+
+{
+  "error": "service_unavailable",
+  "message": "Service temporarily unavailable",
+  "retry_after": 30
+}
+```
+
+**Business Logic:**
+
+**Happy Path (Cache Hit - 95%+ of requests):**
+1. Extract `shortCode` from URL path (e.g., `/aB3xY9` → `aB3xY9`)
+2. Validate short code format (6-8 alphanumeric characters, base62)
+3. Construct Redis key: `url:aB3xY9`
+4. Execute Redis GET operation (1-2ms typical)
+5. If value exists in cache:
+   - Parse long URL from Redis value
+   - Return HTTP 301 redirect with `Location` header
+   - Include `X-Cache-Status: HIT` header
+   - Log request with cache hit metric
+   - **Total latency: 3-5ms**
+
+**Sad Path (Cache Miss - <5% of requests):**
+1. Extract and validate `shortCode` as above
+2. Construct Redis key: `url:aB3xY9`
+3. Execute Redis GET operation (1-2ms)
+4. Cache miss detected
+5. Query PostgreSQL read replica:
+   ```sql
+   SELECT long_url FROM url_mappings WHERE short_code = $1;
+   ```
+6. If row found in database:
+   - Store result in Redis with TTL: `SET url:aB3xY9 {longUrl} EX 3600`
+   - Return HTTP 301 redirect with `Location` header
+   - Include `X-Cache-Status: MISS` header
+   - Log request with cache miss metric
+   - **Total latency: 15-20ms**
+7. If row not found in database:
+   - Return HTTP 404 Not Found
+   - Include error details in JSON response
+   - Log 404 event
+   - **Do not cache negative results** (prevents cache pollution)
+
+**Edge Cases:**
+
+**Case 1: Invalid Short Code Format**
+- Input: `/ab@#$` or `/toolongshortcode123`
+- Validation: Regex check `^[a-zA-Z0-9]{6,8}$`
+- Response: HTTP 400 Bad Request
+- Action: Return error immediately without cache/DB lookup
+- Latency: <1ms
+
+**Case 2: Redis Connection Failure**
+- Scenario: Redis unavailable or timeout
+- Fallback: Skip cache, query PostgreSQL directly
+- Response: HTTP 301 if found, HTTP 404 if not found
+- Action: 
+  - Log Redis failure with ERROR severity
+  - Increment `redis_connection_errors_total` metric
+  - Do not cache result (Redis unavailable)
+  - Alert on-call if error rate exceeds threshold
+- Latency: 10-15ms (DB query only)
+
+**Case 3: PostgreSQL Connection Failure**
+- Scenario: Database unavailable or timeout
+- Response: HTTP 503 Service Unavailable with `Retry-After: 30`
+- Action:
+  - Log database failure with ERROR severity
+  - Increment `db_connection_errors_total` metric
+  - Return retry-after header for client backoff
+  - Trigger critical alert
+- Latency: Timeout threshold (5 seconds)
+
+**Case 4: Both Redis and PostgreSQL Unavailable**
+- Scenario: Complete data layer failure
+- Response: HTTP 503 Service Unavailable
+- Action:
+  - Log catastrophic failure
+  - Trigger critical alert to page on-call
+  - Health check endpoint will fail
+  - Cloud Run will attempt to restart instances
+  - Load balancer will route to healthy instances
+
+**Case 5: Empty Short Code**
+- Input: `/` (root path)
+- Response: HTTP 404 Not Found (no redirect service owns root)
+- Action: Let load balancer handle root path routing
+
+**Case 6: Malformed URL in Database**
+- Scenario: Database contains invalid URL (data corruption)
+- Detection: URL validation before redirect
+- Response: HTTP 500 Internal Server Error
+- Action:
+  - Log data integrity error with ERROR severity
+  - Increment `data_integrity_errors_total` metric
+  - Do not cache corrupted data
+  - Alert for manual investigation
+
+**Case 7: Extremely Long URL in Database**
+- Scenario: Long URL exceeds HTTP header size limits (8KB typical)
+- Response: HTTP 500 Internal Server Error
+- Action:
+  - Log oversized URL error
+  - Return generic error to client
+  - Alert for data cleanup
+
+**Case 8: High Concurrency for Same Short Code**
+- Scenario: Viral link causes 1000s of simultaneous requests
+- Optimization: Redis handles concurrent reads efficiently
+- Response: All requests receive HTTP 301 from cache
+- Action: Monitor cache hit rate (should remain >99%)
+
+**Case 9: Cache Stampede (Cache Miss Under Load)**
+- Scenario: Popular URL expires from cache, 100s of requests hit simultaneously
+- Mitigation: Single-flight pattern (only one goroutine queries DB)
+- Implementation:
+  ```go
+  // Use singleflight.Group to deduplicate concurrent requests
+  result, err := g.Do(shortCode, func() (interface{}, error) {
+      return queryDatabase(shortCode)
+  })
+  ```
+- Response: All concurrent requests wait for single DB query, then receive result
+- Action: First request populates cache, subsequent requests hit cache
+
+**Case 10: Expired Cache Entry**
+- Scenario: Redis TTL expires (after 3600 seconds)
+- Response: Cache miss, query database, repopulate cache
+- Action: Normal cache miss flow
+- Optimization: Popular URLs remain cached due to frequent access
+
+---
+
+### GET /health
+
+**Description:** Health check endpoint for Cloud Run and load balancer probes. Returns service health status without checking dependencies (liveness probe).
+
+**Request:**
+```http
+GET /health HTTP/1.1
+Host: redirect-service
+```
+
+**Response (200 OK):**
+```http
+HTTP/1.1 200 OK
+Content-Type: application/json
+
+{
+  "status": "healthy",
+  "service": "redirect-service",
+  "version": "1.0.0",
+  "timestamp": "2024-01-15T10:30:00Z"
+}
+```
+
+**Response (503 Service Unavailable):**
+```http
+HTTP/1.1 503 Service Unavailable
+Content-Type: application/json
+
+{
+  "status": "unhealthy",
+  "service": "redirect-service",
+  "version": "1.0.0",
+  "timestamp": "2024-01-15T10:30:00Z",
+  "error": "service shutting down"
+}
+```
+
+**Business Logic:**
+- Always returns 200 OK unless service is shutting down
+- Does not check Redis or PostgreSQL connectivity (liveness, not readiness)
+- Responds in <1ms
+- Used by Cloud Run for container health checks
+- Used by load balancer for instance health
+
+---
+
+### GET /ready
+
+**Description:** Readiness check endpoint that validates connectivity to dependencies (Redis and PostgreSQL). Used to determine if instance can accept traffic.
+
+**Request:**
+```http
+GET /ready HTTP/1.1
+Host: redirect-service
+```
+
+**Response (200 OK):**
+```http
+HTTP/1.1 200 OK
+Content-Type: application/json
+
+{
+  "status": "ready",
+  "service": "redirect-service",
+  "checks": {
+    "redis": "ok",
+    "database": "ok"
+  },
+  "timestamp": "2024-01-15T10:30:00Z"
+}
+```
+
+**Response (503 Service Unavailable):**
+```http
+HTTP/1.1 503 Service Unavailable
+Content-Type: application/json
+
+{
+  "status": "not_ready",
+  "service": "redirect-service",
+  "checks": {
+    "redis": "failed",
+    "database": "ok"
+  },
+  "timestamp": "2024-01-15T10:30:00Z"
+}
+```
+
+**Business Logic:**
+- Executes Redis PING command (timeout: 1 second)
+- Executes PostgreSQL `SELECT 1` query (timeout: 2 seconds)
+- Returns 200 only if both checks pass
+- Returns 503 if any check fails
+- Load balancer removes instance from rotation if readiness fails
+- Check runs every 10 seconds
+
+---
+
+### GET /metrics
+
+**Description:** Prometheus-compatible metrics endpoint for monitoring and alerting.
+
+**Request:**
+```http
+GET /metrics HTTP/1.1
+Host: redirect-service
+```
+
+**Response (200 OK):**
+```http
+HTTP/1.1 200 OK
+Content-Type: text/plain; version=0.0.4
+
+# HELP redirect_requests_total Total number of redirect requests
+# TYPE redirect_requests_total counter
+redirect_requests_total{status="success"} 1523421
+redirect_requests_total{status="not_found"} 8234
+
+# HELP redirect_latency_seconds Redirect request latency
+# TYPE redirect_latency_seconds histogram
+redirect_latency_seconds_bucket{le="0.005"} 1450000
+redirect_latency_seconds_bucket{le="0.01"} 1500000
+redirect_latency_seconds_bucket{le="0.05"} 1520000
+redirect_latency_seconds_bucket{le="+Inf"} 1523421
+
+# HELP cache_hit_total Total cache hits
+# TYPE cache_hit_total counter
+cache_hit_total 1450000
+
+# HELP cache_miss_total Total cache misses
+# TYPE cache_miss_total counter
+cache_miss_total 73421
+
+# HELP redis_connection_errors_total Redis connection errors
+# TYPE redis_connection_errors_total counter
+redis_connection_errors_total 12
+
+# HELP db_connection_errors_total Database connection errors
+# TYPE db_connection_errors_total counter
+db_connection_errors_total 3
+```
+
+**Business Logic:**
+- Exports Prometheus-formatted metrics
+- Scraped by Cloud Monitoring every 60 seconds
+- No authentication required (internal endpoint)
+- Responds in <5ms
+
+---
+
+## Data Model
+
+### Entity: url_mappings (Read-Only Access)
+
+The redirect service has **read-only access** to the `url_mappings` table via PostgreSQL read replica. It does not perform any write operations.
+
+| Field | Type | Constraints | Description |
+|-------|------|-------------|-------------|
+| id | BIGSERIAL | PRIMARY KEY | Auto-incrementing unique identifier |
+| short_code | VARCHAR(8) | UNIQUE NOT NULL | 6-8 character alphanumeric short code (base62) |
+| long_url | TEXT | NOT NULL | Original URL to redirect to (max 2048 characters) |
+| created_at | TIMESTAMP WITH TIME ZONE | NOT NULL, DEFAULT NOW() | Timestamp when mapping was created |
+| created_by_ip | INET | NULL | IP address of client who created the mapping (optional) |
+
+**Indexes:**
+```sql
+CREATE UNIQUE INDEX idx_short_code ON url_mappings(short_code);
+CREATE INDEX idx_created_at ON url_mappings(created_at DESC);
+```
+
+**Constraints:**
+```sql
+ALTER TABLE url_mappings 
+  ADD CONSTRAINT short_code_length CHECK (char_length(short_code) BETWEEN 6 AND 8);
+
+ALTER TABLE url_mappings
+  ADD CONSTRAINT long_url_length CHECK (char_length(long_url) <= 2048);
+```
+
+**Sample Data:**
+```sql
+INSERT INTO url_mappings (short_code, long_url, created_by_ip) VALUES
+  ('aB3xY9', 'https://example.com/very/long/url/path?query=params', '203.0.113.42'),
+  ('xK9pL2', 'https://github.com/example/repository/issues/1234', '198.51.100.10'),
+  ('mN5qR8', 'https://docs.google.com/document/d/1A2B3C4D5E6F7G8H9I0J', '192.0.2.100');
+```
+
+**Query Patterns:**
+
+**Primary Query (Cache Miss Lookup):**
+```sql
+-- Used when Redis cache miss occurs
+SELECT long_url 
+FROM url_mappings 
+WHERE short_code = $1;
+
+-- Expected execution time: 5-10ms
+-- Index used: idx_short_code (unique index scan)
+-- Rows returned: 0 or 1
+```
+
+**Performance Characteristics:**
+- Query uses unique index (O(log n) complexity)
+- Single row lookup (no joins)
+- Read from replica (no write contention)
+- Connection pooling enabled (max 50 connections)
+
+### Cache Data Model (Redis)
+
+**Key Pattern:**
+```
+url:{shortCode}
+```
+
+**Value:**
+```
+{longUrl}
+```
+
+**TTL:** 3600 seconds (1 hour)
+
+**Examples:**
+```redis
+SET url:aB3xY9 "https://example.com/very/long/url/path?query=params" EX 3600
+SET url:xK9pL2 "https://github.com/example/repository/issues/1234" EX 3600
+SET url:mN5qR8 "https://docs.google.com/document/d/1A2B3C4D5E6F7G8H9I0J" EX 3600
+```
+
+**Cache Operations:**
+
+**Read (Cache Lookup):**
+```redis
+GET url:aB3xY9
+-- Returns: "https://example.com/very/long/url/path?query=params"
+-- Latency: 1-2ms (typical)
+```
+
+**Write (Cache Population):**
+```redis
+SET url:aB3xY9 "https://example.com/very/long/url/path?query=params" EX 3600
+-- Returns: OK
+-- Latency: 1-2ms
+```
+
+**Cache Eviction Policy:**
+- `allkeys-lru`: Evict least recently used keys when memory full
+- Ensures hot URLs remain cached
+- Cold URLs naturally expire after 1 hour
+
+**Memory Estimation:**
+- Average key size: 10 bytes (`url:aB3xY9`)
+- Average value size: 100 bytes (average URL length)
+- Overhead per entry: ~100 bytes (Redis metadata)
+- Total per entry: ~210 bytes
+- 5GB Redis capacity: ~25 million cached entries
+
+### Relationships
+
+**No relationships within redirect-service** - this is a read-only service with a single table access pattern.
+
+**Cross-Service Relationship:**
+- `url_mappings` table is written by `shortening-service`
+- `redirect-service` reads from PostgreSQL read replica
+- Replication lag typically <100ms
+- Stale reads acceptable (eventual consistency)
+
+---
+
+## Business Logic Specifications
+
+### Short Code Validation
+
+**Purpose:** Ensure short code meets format requirements before processing
+
+**Algorithm:**
+```go
+func validateShortCode(code string) error {
+    // Length check
+    if len(code) < 6 || len(code) > 8 {
+        return ErrInvalidShortCodeLength
+    }
+    
+    // Character set check (base62: a-zA-Z0-9)
+    matched, _ := regexp.MatchString(`^[a-zA-Z0-9]+$`, code)
+    if !matched {
+        return ErrInvalidShortCodeCharacters
+    }
+    
+    return nil
+}
+```
+
+**Error Cases:**
+- Empty string → `invalid_short_code`
+- Too short (<6 chars) → `invalid_short_code`
+- Too long (>8 chars) → `invalid_short_code`
+- Invalid characters → `invalid_short_code`
+
+**Performance:** <0.1ms per validation
+
+---
+
+### Cache Lookup Strategy
+
+**Purpose:** Retrieve long URL from Redis with fallback to database
+
+**Algorithm:**
+```go
+func getLongURL(ctx context.Context, shortCode string) (string, error) {
+    // Step 1: Validate short code
+    if err := validateShortCode(shortCode); err != nil {
+        return "", err
+    }
+    
+    // Step 2: Construct Redis key
+    cacheKey := fmt.Sprintf("url:%s", shortCode)
+    
+    // Step 3: Attempt Redis lookup
+    longURL, err := redisClient.Get(ctx, cacheKey).Result()
+    if err == nil {
+        // Cache hit
+        metrics.CacheHits.Inc()
+        return longURL, nil
+    }
+    
+    // Step 4: Handle Redis errors
+    if err != redis.Nil {
+        // Redis connection error, not just cache miss
+        logger.Error("redis_error", zap.Error(err))
+        metrics.RedisErrors.Inc()
+        // Continue to database fallback
+    }
+    
+    // Step 5: Cache miss - query database
+    metrics.CacheMisses.Inc()
+    longURL, err = queryDatabase(ctx, shortCode)
+    if err != nil {
+        return "", err
+    }
+    
+    // Step 6: Populate cache (fire-and-forget)
+    go func() {
+        ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+        defer cancel()
+        _ = redisClient.Set(ctx, cacheKey, longURL, 3600*time.Second).Err()
+    }()
+    
+    return longURL, nil
+}
+```
+
+**Cache Hit Path:**
+1. Validate short code (0.1ms)
+2. Redis GET (1-2ms)
+3. Return result (total: ~3ms)
+
+**Cache Miss Path:**
+1. Validate short code (0.1ms)
+2. Redis GET returns nil (1-2ms)
+3. Database query (5-10ms)
+4. Async cache population (1-2ms, non-blocking)
+5. Return result (total: ~15ms)
+
+**Error Handling:**
+- Redis timeout → fallback to database
+- Redis connection refused → fallback to database
+- Database timeout → return 503
+- Database not found → return 404
+
+---
+
+### URL Validation (Pre-Redirect)
+
+**Purpose:** Validate long URL retrieved from database before redirecting
+
+**Algorithm:**
+```go
+func validateLongURL(url string) error {
+    // Length check
+    if len(url) == 0 || len(url) > 2048 {
+        return ErrInvalidURLLength
+    }
+    
+    // Scheme check
+    if !strings.HasPrefix(url, "http://") && !strings.HasPrefix(url, "https://") {
+        return ErrInvalidURLScheme
+    }
+    
+    // Parse URL
+    parsed, err := url.Parse(url)
+    if err != nil {
+        return ErrMalformedURL
+    }
+    
+    // Host check
+    if parsed.Host == "" {
+        return ErrMissingHost
+    }
+    
+    return nil
+}
+```
+
+**Error Cases:**
+- Empty URL → `data_integrity_error` (log and alert)
+- Missing scheme → `data_integrity_error`
+- Invalid characters → `data_integrity_error`
+- Missing host → `data_integrity_error`
+
+**Action on Validation Failure:**
+- Log error with ERROR severity
+- Increment `data_integrity_errors_total` metric
+- Return HTTP 500 to client
+- Trigger alert for manual investigation
+- **Do not cache invalid URLs**
+
+---
+
+### Connection Pool Management
+
+**Redis Connection Pool:**
+```go
+redisClient := redis.NewClient(&redis.Options{
+    Addr:         os.Getenv("REDIS_HOST") + ":6379",
+    Password:     os.Getenv("REDIS_PASSWORD"),
+    DB:           0,
+    PoolSize:     100,  // Max connections
+    MinIdleConns: 10,   // Keep-alive connections
+    MaxRetries:   2,    // Retry failed commands
+    DialTimeout:  1 * time.Second,
+    ReadTimeout:  1 * time.Second,
+    WriteTimeout: 1 * time.Second,
+})
+```
+
+**PostgreSQL Connection Pool:**
+```go
+dbConfig, _ := pgxpool.ParseConfig(os.Getenv("DATABASE_URL"))
+dbConfig.MaxConns = 50                    // Max connections
+dbConfig.MinConns = 5                     // Keep-alive connections
+dbConfig.MaxConnLifetime = 1 * time.Hour  // Recycle connections
+dbConfig.MaxConnIdleTime = 5 * time.Minute
+dbConfig.HealthCheckPeriod = 1 * time.Minute
+
+dbPool, _ := pgxpool.NewWithConfig(context.Background(), dbConfig)
+```
+
+**Connection Lifecycle:**
+- Connections established at startup
+- Idle connections maintained for fast access
+- Connections recycled periodically
+- Health checks detect stale connections
+
+---
+
+### Request Timeout Handling
+
+**Timeout Configuration:**
+```go
+const (
+    RedisTimeout    = 1 * time.Second   // Redis operations
+    DatabaseTimeout = 5 * time.Second   // Database queries
+    RequestTimeout  = 10 * time.Second  // Overall request
+)
+```
+
+**Implementation:**
+```go
+func handleRedirect(w http.ResponseWriter, r *http.Request) {
+    // Create request context with timeout
+    ctx, cancel := context.WithTimeout(r.Context(), RequestTimeout)
+    defer cancel()
+    
+    // Extract short code
+    shortCode := chi.URLParam(r, "shortCode")
+    
+    // Get long URL with context
+    longURL, err := getLongURL(ctx, shortCode)
+    if err != nil {
+        if ctx.Err() == context.DeadlineExceeded {
+            // Timeout occurred
+            respondError(w, http.StatusGatewayTimeout, "request_timeout")
+            return
+        }
+        // Handle other errors
+        handleError(w, err)
+        return
+    }
+    
+    // Perform redirect
+    http.Redirect(w, r, longURL, http.StatusMovedPermanently)
+}
+```
+
+---
+
+### Graceful Shutdown
+
+**Purpose:** Drain in-flight requests before terminating
+
+**Algorithm:**
+```go
+func gracefulShutdown(server *http.Server) {
+    // Listen for SIGTERM from Cloud Run
+    sigChan := make(chan os.Signal, 1)
+    signal.Notify(sigChan, syscall.SIGTERM, syscall.SIGINT)
+    
+    <-sigChan
+    logger.Info("shutdown signal received")
+    
+    // Stop accepting new requests
+    ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+    defer cancel()
+    
+    // Wait for in-flight requests to complete
+    if err := server.Shutdown(ctx); err != nil {
+        logger.Error("shutdown error", zap.Error(err))
+    }
+    
+    // Close database connections
+    dbPool.Close()
+    
+    // Close Redis connections
+    redisClient.Close()
+    
+    logger.Info("shutdown complete")
+}
+```
+
+**Shutdown Sequence:**
+1. Receive SIGTERM signal (Cloud Run sends 10s before kill)
+2. Stop accepting new requests
+3. Wait up to 30s for in-flight requests to complete
+4. Close database connection pool
+5. Close Redis connection pool
+6. Exit process
+
+---
+
+## GCP Resources
+
+### Cloud Run Service
+
+**Service Configuration:**
+```yaml
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: redirect-service
+  namespace: default
+  annotations:
+    run.googleapis.com/ingress: internal-and-cloud-load-balancing
+spec:
+  template:
+    metadata:
+      annotations:
+        autoscaling.knative.dev/minScale: "5"
+        autoscaling.knative.dev/maxScale: "500"
+        run.googleapis.com/cpu-throttling: "false"
+        run.googleapis.com/startup-cpu-boost: "true"
+    spec:
+      containerConcurrency: 250
+      timeoutSeconds: 10
+      serviceAccountName: redirect-service@PROJECT_ID.iam.gserviceaccount.com
+      containers:
+      - name: redirect-service
+        image: gcr.io/PROJECT_ID/redirect-service:latest
+        ports:
+        - name: http1
+          containerPort: 8081
+        resources:
+          limits:
+            cpu: "1000m"
+            memory: "256Mi"
+        env:
+        - name: PORT
+          value: "8081"
+        - name: REDIS_HOST
+          valueFrom:
+            secretKeyRef:
+              name: redis-config
+              key: host
+        - name: REDIS_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: redis-config
+              key: password
+        - name: DATABASE_URL
+          valueFrom:
+            secretKeyRef:
+              name: database-config
+              key: replica_url
+        - name: LOG_LEVEL
+          value: "info"
+        - name: ENVIRONMENT
+          value: "production"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8081
+          initialDelaySeconds: 10
+          periodSeconds: 10
+          timeoutSeconds: 1
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: 8081
+          initialDelaySeconds: 5
+          periodSeconds: 10
+          timeoutSeconds: 3
+          failureThreshold: 2
+```
+
+**Scaling Configuration:**
+- **Min Instances:** 5 (always warm, handles baseline traffic)
+- **Max Instances:** 500 (supports 125,000 req/s at 250 concurrent/instance)
+- **Concurrency:** 250 requests per instance (optimized for I/O-bound workload)
+- **CPU:** 1 vCPU per instance
+- **Memory:** 256Mi per instance (minimal footprint)
+- **CPU Throttling:** Disabled (always-on CPU for low latency)
+- **Startup CPU Boost:** Enabled (faster cold starts)
+
+**Auto-Scaling Triggers:**
+- Target concurrency: 200 requests per instance (80% of max)
+- Scale-up latency: ~10 seconds (Cloud Run cold start)
+- Scale-down delay: 5 minutes of low traffic
+
+**Cost Estimation:**
+- Min instances (5): ~$100/month
+- Typical load (50 instances): ~$500/month
+- Peak load (500 instances): ~$5,000/month (scales down quickly)
+
+---
+
+### Cloud SQL PostgreSQL (Read Replica)
+
+**Instance Configuration:**
+```yaml
+name: url-shortener-replica-1
+tier: db-custom-2-8192  # 2 vCPU, 8GB RAM
+region: us-central1
+database_version: POSTGRES_15
+replica_configuration:
+  master_instance_name: url-shortener-primary
+  failover_target: false
+settings:
+  ip_configuration:
+    ipv4_enabled: false
+    private_network: projects/PROJECT_ID/global/networks/url-shortener-vpc
+    require_ssl: true
+  backup_configuration:
+    enabled: false  # Replicas don't need separate backups
+  database_flags:
+    - name: max_connections
+      value: "200"
+    - name: shared_buffers
+      value: "2GB"
+    - name: effective_cache_size
+      value: "6GB"
+    - name: random_page_cost
+      value: "1.1"  # SSD optimization
+```
+
+**Connection Details:**
+- **Private IP:** 10.0.0.10 (VPC-internal)
+- **Port:** 5432
+- **Database:** url_shortener
+- **User:** redirect_service (read-only role)
+- **SSL:** Required (TLS 1.3)
+- **Connection String:** `postgresql://redirect_service:PASSWORD@10.0.0.10:5432/url_shortener?sslmode=require`
+
+**Read-Only Role:**
+```sql
+CREATE ROLE redirect_service WITH LOGIN PASSWORD 'SECURE_PASSWORD';
+GRANT CONNECT ON DATABASE url_shortener TO redirect_service;
+GRANT USAGE ON SCHEMA public TO redirect_service;
+GRANT SELECT ON url_mappings TO redirect_service;
+```
+
+**Performance Characteristics:**
+- Query latency: 5-10ms (p99)
+- Replication lag: <100ms (typical)
+- Max connections: 200 (50 per replica × 2 replicas + buffer)
+- Connection pooling: 50 connections per Cloud Run instance
+
+---
+
+### Memorystore Redis
+
+**Instance Configuration:**
+```yaml
+name: url-shortener-redis
+tier: STANDARD_HA  # High availability with automatic failover
+memory_size_gb: 5
+region: us-central1
+redis_version: REDIS_7_0
+authorized_network: projects/PROJECT_ID/global/networks/url-shortener-vpc
+connect_mode: PRIVATE_SERVICE_ACCESS
+persistence_mode: RDB
+rdb_snapshot_period: ONE_HOUR
+rdb_snapshot_start_time: "03:00"
+redis_configs:
+  maxmemory-policy: allkeys-lru
+  timeout: "300"
+  tcp-keepalive: "60"
+```
+
+**Connection Details:**
+- **Primary IP:** 10.0.1.10
+- **Port:** 6379
+- **AUTH:** Enabled (password in Secret Manager)
+- **Connection String:** `redis://:PASSWORD@10.0.1.10:6379/0`
+
+**Memory Allocation:**
+-
+
+## Architecture Guidelines
+# Architecture: URL Shortener Service
+
+## Goal
+
+Design a high-performance, scalable URL shortening system that prioritizes low-latency redirects and reliable URL shortening. The architecture follows microservices principles with separate services for write operations (URL shortening) and read operations (redirects) to optimize for the read-heavy traffic pattern. The system leverages caching extensively to meet aggressive latency requirements and uses GCP managed services for scalability and reliability.
+
+## Architecture Diagram
+
+```mermaid
+graph TB
+    subgraph "Client Layer"
+        API_CLIENT[API Clients]
+        BROWSER[Web Browsers]
+    end
+
+    subgraph "Edge Layer"
+        LB[Cloud Load Balancer]
+        CDN[Cloud CDN - Optional]
+    end
+
+    subgraph "Application Layer - Cloud Run"
+        SHORTEN[Shortening Service<br/>Go + Chi<br/>Port 8080]
+        REDIRECT[Redirect Service<br/>Go + Chi<br/>Port 8081]
+    end
+
+    subgraph "Caching Layer"
+        REDIS[Memorystore Redis<br/>Cache Tier]
+    end
+
+    subgraph "Data Layer"
+        POSTGRES[(Cloud SQL PostgreSQL<br/>Primary)]
+        REPLICA[(Cloud SQL PostgreSQL<br/>Read Replica)]
+    end
+
+    subgraph "Observability"
+        LOGGING[Cloud Logging]
+        MONITORING[Cloud Monitoring]
+        TRACE[Cloud Trace]
+    end
+
+    API_CLIENT -->|POST /api/v1/shorten| LB
+    BROWSER -->|GET /{shortCode}| LB
+    
+    LB -->|/api/v1/*| SHORTEN
+    LB -->|/{shortCode}| REDIRECT
+    
+    SHORTEN -->|Write| POSTGRES
+    SHORTEN -->|Invalidate| REDIS
+    
+    REDIRECT -->|Read Cache| REDIS
+    REDIS -.->|Cache Miss| REDIRECT
+    REDIRECT -->|Read DB| REPLICA
+    REDIRECT -->|Write Back Cache| REDIS
+    
+    POSTGRES -->|Replicate| REPLICA
+    
+    SHORTEN --> LOGGING
+    REDIRECT --> LOGGING
+    SHORTEN --> MONITORING
+    REDIRECT --> MONITORING
+    SHORTEN --> TRACE
+    REDIRECT --> TRACE
+
+    style REDIRECT fill:#90EE90
+    style REDIS fill:#FFD700
+    style POSTGRES fill:#4169E1
+    style REPLICA fill:#6495ED
+```
+
+## Tech Stack Overview
+
+| Layer | Technology |
+|-------|------------|
+| Frontend | N/A (API-only service) |
+| Backend | Go 1.21+ with Chi v5 router |
+| Database | PostgreSQL 15 (Cloud SQL) |
+| Cache | Redis 7.0 (Memorystore) |
+| Cloud | GCP (Cloud Run, Cloud SQL, Memorystore, Cloud Load Balancer) |
+| Container | Docker with Cloud Run |
+| Repository | GitHub |
+| CI/CD | GitHub Actions |
+| Observability | Cloud Logging, Cloud Monitoring, Cloud Trace |
+
+## Services Overview
+
+| Service | Responsibility | Tech Stack | Port |
+|---------|----------------|------------|------|
+| shortening-service | URL shortening, validation, short code generation | Go 1.21 + Chi v5 | 8080 |
+| redirect-service | High-performance URL redirects with caching | Go 1.21 + Chi v5 | 8081 |
+
+---
+
+## Service: shortening-service
+
+### Responsibilities
+- Accept and validate long URLs via REST API
+- Generate unique, collision-free short codes
+- Store URL mappings in PostgreSQL
+- Invalidate cache entries when needed
+- Implement rate limiting to prevent abuse
+- Sanitize URLs to prevent injection attacks
+- Return shortened URLs to clients
+
+### Tech Stack
+- **Language**: Go 1.21+
+- **Framework**: Chi v5 (lightweight, fast HTTP router)
+- **Database**: PostgreSQL 15 (Cloud SQL)
+- **Cache**: Redis 7.0 (Memorystore) - for cache invalidation
+- **Libraries**:
+  - `go-chi/chi/v5` - HTTP router
+  - `jackc/pgx/v5` - PostgreSQL driver
+  - `go-redis/redis/v9` - Redis client
+  - `google.golang.org/api/idtoken` - Authentication (future)
+  - `golang.org/x/time/rate` - Rate limiting
+
+### Mapped Requirements
+- **FR-001**: URL Shortening API - Primary implementation
+- **FR-003**: URL Validation - Input validation middleware
+- **FR-004**: Short Code Generation - Unique ID generation algorithm
+- **FR-005**: Persistent Storage - PostgreSQL writes
+- **NFR Performance**: < 200ms p99 latency for shortening
+- **NFR Scalability**: Horizontal scaling via Cloud Run
+- **NFR Security**: Input sanitization, rate limiting, HTTPS enforcement
+
+### API Endpoints
+
+#### POST /api/v1/shorten
+Request:
+```json
+{
+  "url": "https://example.com/very/long/url/path?query=params"
+}
+```
+
+Response (201 Created):
+```json
+{
+  "short_code": "aB3xY9",
+  "short_url": "https://short.link/aB3xY9",
+  "long_url": "https://example.com/very/long/url/path?query=params",
+  "created_at": "2024-01-15T10:30:00Z"
+}
+```
+
+Error Response (400 Bad Request):
+```json
+{
+  "error": "invalid_url",
+  "message": "URL must start with http:// or https://"
+}
+```
+
+Error Response (429 Too Many Requests):
+```json
+{
+  "error": "rate_limit_exceeded",
+  "message": "Too many requests. Please try again later.",
+  "retry_after": 60
+}
+```
+
+### Short Code Generation Algorithm
+
+**Approach**: Snowflake-inspired distributed ID generation + Base62 encoding
+
+```
+Components:
+- Timestamp (41 bits): Milliseconds since epoch
+- Worker ID (10 bits): Cloud Run instance identifier
+- Sequence (12 bits): Counter for same millisecond
+
+Result: 63-bit unique integer → Base62 encode → 6-8 character string
+```
+
+**Base62 Character Set**: `0-9a-zA-Z` (62 characters)
+
+### Database Schema
+
+```sql
+CREATE TABLE url_mappings (
+    id BIGSERIAL PRIMARY KEY,
+    short_code VARCHAR(8) UNIQUE NOT NULL,
+    long_url TEXT NOT NULL,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    created_by_ip INET,
+    
+    -- Indexes
+    CONSTRAINT short_code_length CHECK (char_length(short_code) BETWEEN 6 AND 8)
+);
+
+CREATE INDEX idx_short_code ON url_mappings(short_code);
+CREATE INDEX idx_created_at ON url_mappings(created_at DESC);
+```
+
+### Dependencies
+- PostgreSQL (Cloud SQL) - Primary data store
+- Redis (Memorystore) - Cache invalidation
+- Cloud Logging - Structured logging
+- Cloud Monitoring - Metrics export
+- Cloud Trace - Distributed tracing
+
+### Integrations
+- **Database**: Direct connection to Cloud SQL via private IP
+- **Cache**: Connection to Memorystore Redis via VPC
+- **Load Balancer**: Receives traffic on `/api/v1/*` paths
+- **Monitoring**: Exports metrics to Cloud Monitoring
+
+### Rate Limiting Strategy
+- **Per IP**: 100 requests per minute
+- **Global**: 1,000 requests per second (handled by auto-scaling)
+- **Implementation**: Token bucket algorithm with Redis backing
+
+### Acceptance Criteria
+- [ ] API accepts valid HTTP/HTTPS URLs
+- [ ] API rejects malformed URLs with appropriate error messages
+- [ ] API rejects empty or missing URL field
+- [ ] Short codes are 6-8 alphanumeric characters
+- [ ] Short codes are unique (no collisions)
+- [ ] URL mappings persist in PostgreSQL
+- [ ] Response includes short_code, short_url, and long_url
+- [ ] P99 latency < 200ms under load
+- [ ] Rate limiting prevents abuse (429 responses)
+- [ ] Input sanitization prevents SQL injection
+- [ ] HTTPS enforced for all endpoints
+- [ ] Handles 1,000 requests/second with auto-scaling
+- [ ] Graceful error handling for database failures
+- [ ] Structured logs exported to Cloud Logging
+- [ ] Metrics exported to Cloud Monitoring
+- [ ] Health check endpoint responds at `/health`
+
+---
+
+## Service: redirect-service
+
+### Responsibilities
+- Accept requests with short codes
+- Perform high-speed cache lookups
+- Query database on cache misses
+- Execute HTTP 301 redirects to original URLs
+- Populate cache with frequently accessed URLs
+- Return 404 for invalid short codes
+- Achieve < 50ms p99 latency
+
+### Tech Stack
+- **Language**: Go 1.21+
+- **Framework**: Chi v5 (minimal overhead for redirects)
+- **Database**: PostgreSQL 15 (Cloud SQL Read Replica)
+- **Cache**: Redis 7.0 (Memorystore) - primary data source
+- **Libraries**:
+  - `go-chi/chi/v5` - HTTP router
+  - `jackc/pgx/v5` - PostgreSQL driver
+  - `go-redis/redis/v9` - Redis client with pipelining
+
+### Mapped Requirements
+- **FR-002**: URL Redirect - Primary implementation
+- **FR-005**: Persistent Storage - Read from PostgreSQL replica
+- **NFR Performance**: < 50ms p99 latency for redirects
+- **NFR Scalability**: Handles 10,000 requests/second
+- **NFR Availability**: 99.9% uptime, higher priority than shortening
+
+### API Endpoints
+
+#### GET /{shortCode}
+Response (301 Moved Permanently):
+```
+HTTP/1.1 301 Moved Permanently
+Location: https://example.com/very/long/url/path?query=params
+Cache-Control: public, max-age=300
+```
+
+Response (404 Not Found):
+```json
+{
+  "error": "not_found",
+  "message": "Short code not found"
+}
+```
+
+### Caching Strategy
+
+**Cache Structure** (Redis):
+```
+Key: "url:{shortCode}"
+Value: "{longUrl}"
+TTL: 3600 seconds (1 hour)
+```
+
+**Cache-Aside Pattern**:
+1. Check Redis for `url:{shortCode}`
+2. If found (cache hit): Return URL and redirect
+3. If not found (cache miss):
+   - Query PostgreSQL read replica
+   - If found: Store in Redis with TTL, then redirect
+   - If not found: Return 404
+
+**Cache Warming**: Most popular URLs stay cached due to access frequency
+
+**Cache Invalidation**: Handled by shortening-service (not required for current scope)
+
+### Read Flow Optimization
+
+```
+Request → Parse shortCode (0.1ms)
+       → Redis GET (1-2ms typical)
+       → [Cache Hit 95%+] → Redirect (total: ~3-5ms)
+       → [Cache Miss 5%-] → PostgreSQL Query (5-10ms)
+                          → Redis SET (1-2ms)
+                          → Redirect (total: ~15-20ms)
+```
+
+### Database Schema (Read-Only Access)
+
+```sql
+-- Same schema as shortening-service, read from replica
+-- Read replica provides:
+-- - Reduced load on primary database
+-- - Lower latency for geographically distributed reads
+-- - High availability if primary fails
+```
+
+### Dependencies
+- PostgreSQL Read Replica (Cloud SQL) - Fallback data source
+- Redis (Memorystore) - Primary data source for hot paths
+- Cloud Load Balancer - Traffic distribution
+- Cloud Logging - Request logging
+- Cloud Monitoring - Performance metrics
+- Cloud Trace - Latency analysis
+
+### Integrations
+- **Cache**: Primary dependency via VPC connection to Memorystore
+- **Database**: Read-only connection to Cloud SQL replica via private IP
+- **Load Balancer**: Receives traffic on `/{shortCode}` paths
+- **Monitoring**: Real-time latency metrics to Cloud Monitoring
+
+### Performance Optimizations
+- **Connection Pooling**: Maintain persistent connections to Redis and PostgreSQL
+- **Minimal Allocations**: Reuse buffers, avoid unnecessary string operations
+- **Fast Path**: Cache hits bypass database entirely
+- **Async Logging**: Non-blocking log writes
+- **HTTP/2**: Multiplexing for concurrent requests
+- **Keep-Alive**: Connection reuse
+
+### Acceptance Criteria
+- [ ] Accepts short code in URL path (e.g., `/aB3xY9`)
+- [ ] Returns 301 redirect to original URL
+- [ ] Returns 404 for invalid/non-existent short codes
+- [ ] P99 latency < 50ms under load
+- [ ] P50 latency < 10ms (cache hits)
+- [ ] Cache hit rate > 95% for steady-state traffic
+- [ ] Handles 10,000 requests/second with auto-scaling
+- [ ] Reads from PostgreSQL replica on cache miss
+- [ ] Populates Redis cache on database reads
+- [ ] Graceful degradation if Redis unavailable (fallback to DB)
+- [ ] Health check endpoint responds at `/health`
+- [ ] Readiness check validates Redis and DB connectivity
+- [ ] Structured logs exported to Cloud Logging
+- [ ] Latency metrics exported to Cloud Monitoring
+- [ ] Distributed traces capture end-to-end flow
+
+---
+
+## Infrastructure
+
+### GCP Resources
+
+#### Cloud Run Services
+```yaml
+shortening-service:
+  region: us-central1
+  min_instances: 2
+  max_instances: 100
+  cpu: 1
+  memory: 512Mi
+  concurrency: 80
+  timeout: 10s
+  
+redirect-service:
+  region: us-central1
+  min_instances: 5
+  max_instances: 500
+  cpu: 1
+  memory: 256Mi
+  concurrency: 250
+  timeout: 5s
+```
+
+#### Cloud SQL (PostgreSQL 15)
+```yaml
+primary:
+  tier: db-custom-2-8192  # 2 vCPU, 8GB RAM
+  region: us-central1
+  high_availability: true
+  backup:
+    enabled: true
+    start_time: "03:00"
+    retention_days: 7
+  flags:
+    max_connections: 200
+    shared_buffers: 2GB
+    
+read_replica:
+  tier: db-custom-2-8192
+  region: us-central1
+  replica_count: 2
+```
+
+#### Memorystore Redis (7.0)
+```yaml
+redis:
+  tier: STANDARD_HA  # High availability
+  memory_size_gb: 5
+  region: us-central1
+  replica_count: 1
+  persistence: RDB
+  eviction_policy: allkeys-lru
+```
+
+#### Cloud Load Balancer
+```yaml
+load_balancer:
+  type: HTTPS
+  protocol: HTTP/2
+  backend_services:
+    - name: shortening-backend
+      path_matcher: /api/v1/*
+      target: shortening-service
+      timeout: 10s
+    - name: redirect-backend
+      path_matcher: /*
+      target: redirect-service
+      timeout: 5s
+  ssl_certificates:
+    - managed_certificate: short.link
+```
+
+#### VPC Network
+```yaml
+vpc:
+  name: url-shortener-vpc
+  subnet:
+    name: url-shortener-subnet
+    region: us-central1
+    ip_range: 10.0.0.0/24
+  
+  serverless_vpc_access:
+    connector: url-shortener-connector
+    ip_range: 10.1.0.0/28
+    min_instances: 2
+    max_instances: 10
+```
+
+#### Cloud Monitoring & Logging
+```yaml
+monitoring:
+  dashboards:
+    - name: URL Shortener Overview
+      widgets:
+        - request_rate
+        - latency_p50_p99
+        - error_rate
+        - cache_hit_rate
+        
+  alerts:
+    - name: High Latency
+      condition: p99 > 100ms for 5 minutes
+      notification: pagerduty
+    
+    - name: High Error Rate
+      condition: error_rate > 1% for 5 minutes
+      notification: pagerduty
+    
+    - name: Low Cache Hit Rate
+      condition: cache_hit_rate < 90% for 10 minutes
+      notification: slack
+
+logging:
+  retention_days: 30
+  log_sinks:
+    - name: error-logs
+      filter: severity >= ERROR
+      destination: bigquery
+```
+
+### Networking
+
+**Traffic Flow**:
+1. Client requests hit Cloud Load Balancer (HTTPS)
+2. Load Balancer terminates SSL
+3. Routes to appropriate Cloud Run service based on path:
+   - `/api/v1/*` → shortening-service
+   - `/{shortCode}` → redirect-service
+4. Services connect to Redis/PostgreSQL via Serverless VPC Connector
+5. Private IP communication within VPC (no public internet)
+
+**Security**:
+- Cloud Load Balancer: HTTPS only, managed SSL certificates
+- Cloud Run: Ingress from load balancer only
+- Cloud SQL: Private IP only, no public access
+- Memorystore: VPC-native, no public access
+- IAM: Service accounts with least-privilege permissions
+
+**DNS Configuration**:
+```
+short.link → Cloud Load Balancer IP
+```
+
+### Disaster Recovery
+
+**Backup Strategy**:
+- Cloud SQL: Automated daily backups, 7-day retention
+- Point-in-time recovery available
+- Read replicas provide redundancy
+
+**Failover**:
+- Cloud SQL: Automatic failover to standby (HA configuration)
+- Memorystore: Automatic failover to replica
+- Cloud Run: Multi-zone deployment with auto-healing
+
+**Recovery Objectives**:
+- RTO (Recovery Time Objective): < 5 minutes
+- RPO (Recovery Point Objective): < 1 minute
+
+---
+
+## Data Flow Diagrams
+
+### URL Shortening Flow
+```
+┌─────────┐
+│ Client  │
+└────┬────┘
+     │ POST /api/v1/shorten
+     │ {"url": "https://..."}
+     ▼
+┌─────────────────────┐
+│  Load Balancer      │
+└──────────┬──────────┘
+           │
+           ▼
+┌─────────────────────┐
+│ Shortening Service  │
+│  1. Validate URL    │
+│  2. Check rate limit│
+│  3. Generate code   │
+│  4. Store in DB     │
+└──────────┬──────────┘
+           │
+           ├─────────────────┐
+           │                 │
+           ▼                 ▼
+    ┌──────────┐      ┌──────────┐
+    │PostgreSQL│      │  Redis   │
+    │ (Primary)│      │(Optional)│
+    └──────────┘      └──────────┘
+           │
+           │ Return short_code
+           ▼
+     ┌─────────┐
+     │ Client  │
+     └─────────┘
+```
+
+### URL Redirect Flow (Cache Hit)
+```
+┌─────────┐
+│ Browser │
+└────┬────┘
+     │ GET /aB3xY9
+     ▼
+┌─────────────────────┐
+│  Load Balancer      │
+└──────────┬──────────┘
+           │
+           ▼
+┌─────────────────────┐
+│  Redirect Service   │
+│  1. Parse code      │
+│  2. Check Redis     │
+│  3. Cache HIT! ✓    │
+│  4. Return 301      │
+└──────────┬──────────┘
+           │
+           ▼ GET url:aB3xY9
+    ┌──────────┐
+    │  Redis   │ Returns: "https://..."
+    └──────────┘
+           │
+           │ 301 Location: https://...
+           ▼
+     ┌─────────┐
+     │ Browser │ → Redirects to original URL
+     └─────────┘
+```
+
+### URL Redirect Flow (Cache Miss)
+```
+┌─────────┐
+│ Browser │
+└────┬────┘
+     │ GET /aB3xY9
+     ▼
+┌─────────────────────┐
+│  Load Balancer      │
+└──────────┬──────────┘
+           │
+           ▼
+┌─────────────────────┐
+│  Redirect Service   │
+│  1. Parse code      │
+│  2. Check Redis     │
+│  3. Cache MISS ✗    │
+│  4. Query DB        │
+│  5. Store in Redis  │
+│  6. Return 301      │
+└──────────┬──────────┘
+           │
+           ├────────────┐
+           │            │
+           ▼            ▼
+    ┌──────────┐  ┌──────────┐
+    │  Redis   │  │PostgreSQL│
+    │  (Empty) │  │ (Replica)│
+    └──────────┘  └─────┬────┘
+           ▲            │
+           │            │ Returns URL
+           │            ▼
+           │      ┌──────────┐
+           │      │ Service  │
+           └──────┤ SET url  │
+                  └──────────┘
+           │
+           │ 301 Location: https://...
+           ▼
+     ┌─────────┐
+     │ Browser │ → Redirects to original URL
+     └─────────┘
+```
+
+---
+
+## Observability Strategy
+
+### Logging
+
+**Structured Logging Format** (JSON):
+```json
+{
+  "timestamp": "2024-01-15T10:30:00.123Z",
+  "severity": "INFO",
+  "service": "redirect-service",
+  "trace": "projects/PROJECT/traces/TRACE_ID",
+  "request_id": "req-abc123",
+  "method": "GET",
+  "path": "/aB3xY9",
+  "status": 301,
+  "latency_ms": 3.2,
+  "cache_hit": true,
+  "short_code": "aB3xY9"
+}
+```
+
+**Log Levels**:
+- ERROR: Failed requests, database errors, cache failures
+- WARN: Rate limit hits, validation failures
+- INFO: Successful requests (sampled at 1% for redirects)
+- DEBUG: Detailed debugging (disabled in production)
+
+### Metrics
+
+**Key Metrics** (exported to Cloud Monitoring):
+
+**Shortening Service**:
+- `shortening_requests_total` (counter) - Total shortening requests
+- `shortening_latency_seconds` (histogram) - Request latency distribution
+- `shortening_errors_total` (counter) - Failed requests by error type
+- `rate_limit_hits_total` (counter) - Rate limit rejections
+- `short_codes_generated_total` (counter) - Successful code generations
+
+**Redirect Service**:
+- `redirect_requests_total` (counter) - Total redirect requests
+- `redirect_latency_seconds` (histogram) - Request latency distribution
+- `redirect_errors_total` (counter) - Failed redirects (404s)
+- `cache_hit_total` (counter) - Redis cache hits
+- `cache_miss_total` (counter) - Redis cache misses
+- `cache_hit_rate` (gauge) - Cache hit rate percentage
+- `db_query_latency_seconds` (histogram) - Database query latency
+
+**Infrastructure**:
+- `redis_connections_active` (gauge) - Active Redis connections
+- `db_connections_active` (gauge) - Active database connections
+- `cloud_run_instance_count` (gauge) - Number of running instances
+
+### Tracing
+
+**Cloud Trace Integration**:
+- Trace all requests end-to-end
+- Instrument critical paths:
+  - HTTP request handling
+  - Redis operations
+  - PostgreSQL queries
+  - Short code generation
+
+**Trace Sampling**:
+- 100% for requests > 100ms
+- 10% for normal requests
+- Always trace errors
+
+### Dashboards
+
+**Main Dashboard** (Cloud Monitoring):
+1. **Traffic Overview**
+   - Request rate (shortening vs redirect)
+   - Success rate
+   - Error rate by type
+
+2. **Latency**
+   - P50, P95, P99 latency for both services
+   - Latency by cache hit/miss
+
+3. **Cache Performance**
+   - Cache hit rate
+   - Cache miss rate
+   - Redis connection pool usage
+
+4. **Database**
+   - Query latency
+   - Connection pool usage
+   - Replication lag
+
+5. **Infrastructure**
+   - Cloud Run instance count
+   - CPU utilization
+   - Memory utilization
+
+### Alerting Rules
+
+| Alert | Condition | Severity | Action |
+|-------|-----------|----------|--------|
+| High Redirect Latency | P99 > 50ms for 5 min | Critical | Page on-call |
+| High Shortening Latency | P99 > 200ms for 5 min | Warning | Slack notification |
+| Low Cache Hit Rate | < 90% for 10 min | Warning | Investigate Redis |
+| High Error Rate | > 1% for 5 min | Critical | Page on-call |
+| Database Replication Lag | > 10 seconds | Warning | Check replica health |
+| Service Down | Health check fails | Critical | Page on-call |
+| Redis Connection Failure | Connection errors | Critical | Page on-call |
+
+---
+
+## Security Architecture
+
+### Authentication & Authorization
+- **Current Scope**: No authentication required (public API)
+- **Future**: API key authentication for shortening endpoint
+- **Service-to-Service**: Service accounts with IAM roles
+
+### Input Validation
+```go
+// URL Validation Rules
+- Must start with http:// or https://
+- Must have valid domain
+- Maximum length: 2048 characters
+- No javascript:, data:, or file: schemes
+- Domain must resolve to valid DNS
+```
+
+### Rate Limiting
+```yaml
+Per IP Address:
+  shortening: 100 requests/minute
+  redirect: 1000 requests/minute
+
+Global:
+  shortening: 1000 requests/second
+  redirect: 10000 requests/second
+
+Implementation:
+  - Token bucket algorithm
+  - Redis-backed for distributed rate limiting
+  - Return 429 with Retry-After header
+```
+
+### Security Headers
+```
+Strict-Transport-Security: max-age=31536000; includeSubDomains
+X-Content-Type-Options: nosniff
+X-Frame-Options: DENY
+X-XSS-Protection: 1; mode=block
+```
+
+### Data Protection
+- **In Transit**: TLS 1.3 for all external communication
+- **At Rest**: Cloud SQL encryption enabled by default
+- **Redis**: AUTH password protection, VPC isolation
+
+### Abuse Prevention
+1. **Rate Limiting**: Prevent spam and DoS attacks
+2. **URL Validation**: Prevent malicious URL injection
+3. **Monitoring**: Alert on suspicious patterns
+4. **Future**: URL blacklist/reputation checking
+
+---
+
+## Deployment Strategy
+
+### CI/CD Pipeline (GitHub Actions)
+
+```yaml
+# .github/workflows/deploy.yml
+
+name: Deploy URL Shortener
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - uses: actions/setup-go@v4
+        with:
+          go-version: '1.21'
+      - run: go test ./...
+      - run: go vet ./...
+      
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - uses: docker/build-push-action@v5
+        with:
+          push: true
+          tags: gcr.io/${{ secrets.GCP_PROJECT }}/shortening-service:${{ github.sha }}
+      
+  deploy-staging:
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: google-github-actions/deploy-cloudrun@v1
+        with:
+          service: shortening-service-staging
+          image: gcr.io/${{ secrets.GCP_PROJECT }}/shortening-service:${{ github.sha }}
+          
+  deploy-production:
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - uses: google-github-actions/deploy-cloudrun@v1
+        with:
+          service: shortening-service
+          image: gcr.io/${{ secrets.GCP_PROJECT }}/shortening-service:${{ github.sha }}
+```
+
+### Deployment Phases
+
+**Phase 1: Infrastructure Setup**
+1. Create VPC network and subnets
+2. Provision Cloud SQL (primary + replica)
+3. Provision Memorystore Redis
+4. Configure Serverless VPC Connector
+5. Set up Cloud Load Balancer
+6. Configure DNS
+
+**Phase 2: Service Deployment**
+1. Deploy shortening-service to Cloud Run (staging)
+2. Deploy redirect-service to Cloud Run (staging)
+3. Run integration tests
+4. Deploy to production with traffic split (10% → 50% → 100%)
+
+**Phase 3: Monitoring & Optimization**
+1. Validate metrics and alerts
+2. Load testing
+3. Performance tuning
+4. Cache warming
+
+### Rollback Strategy
+- **Cloud Run**: Instant rollback to previous revision
+- **Database**: Restore from backup if needed
+- **Traffic**: Gradual traffic shifting allows quick rollback
+
+---
+
+## Testing Strategy
+
+### Unit Tests
+- Service logic (URL validation, short code generation)
+- Database operations (mocked)
+- Cache operations (mocked)
+- Target: 80% code coverage
+
+### Integration Tests
+- End-to-end API tests
+- Database integration
+- Redis integration
+- Error scenarios
+
+### Load Tests
+```yaml
+Shortening Service:
+  - Target: 1,000 req/s sustained
+  - Duration: 10 minutes
+  - Success rate: > 99%
+  - P99 latency: < 200ms
+
+Redirect Service:
+  - Target: 10,000 req/s sustained
+  - Duration: 30 minutes
+  - Success rate: > 99.9%
+  - P99 latency: < 50ms
+  - Cache hit rate: > 95%
+```
+
+### Chaos Testing
+- Redis failure scenarios
+- Database failover
+- Network latency injection
+- Pod termination
+
+---
+
+## Cost Estimation
+
+### Monthly Cost Breakdown (Estimated)
+
+| Resource | Configuration | Estimated Cost |
+|----------|--------------|----------------|
+| Cloud Run (Shortening) | 2-100 instances, 1 vCPU, 512Mi | $50-200 |
+| Cloud Run (Redirect) | 5-500 instances, 1 vCPU, 256Mi | $100-500 |
+| Cloud SQL (Primary) | db-custom-2-8192, HA | $350 |
+| Cloud SQL (Replicas) | 2x db-custom-2-8192 | $500 |
+| Memorystore Redis | 5GB, HA | $150 |
+| Cloud Load Balancer | HTTPS, 2 backends | $20 |
+| VPC Connector | 2-10 instances | $30 |
+| Cloud Logging | 30 days retention | $50 |
+| Cloud Monitoring | Metrics & alerts | $20 |
+| **Total** | | **$1,270-1,820/month** |
+
+**Cost Optimization Opportunities**:
+- Use committed use discounts for predictable load
+- Optimize Cloud Run min instances based on traffic patterns
+- Implement log sampling for high-volume endpoints
+- Consider Cloud SQL shared-core instances for development
+
+---
+
+## Implementation Checklist
+
+### Infrastructure Setup
+- [ ] Create GCP project and enable required APIs
+- [ ] Set up VPC network and subnets
+- [ ] Provision Cloud SQL PostgreSQL (primary + HA)
+- [ ] Provision Cloud SQL read replicas (2x)
+- [ ] Provision Memorystore Redis (HA)
+- [ ] Configure Serverless VPC Connector
+- [ ] Set up Cloud Load Balancer with SSL
+- [ ] Configure DNS for short domain
+- [ ] Set up Cloud Monitoring workspace
+- [ ] Configure Cloud Logging sinks
+
+### Shortening Service Implementation
+- [ ] Initialize Go project with Chi framework
+- [ ] Implement URL validation middleware
+- [ ] Implement rate limiting middleware
+- [ ] Implement short code generation (Snowflake-based)
+- [ ] Implement PostgreSQL connection pool
+- [ ] Implement Redis client for cache invalidation
+- [ ] Create POST /api/v1/shorten endpoint
+- [ ] Create GET /health endpoint
+- [ ] Add structured logging
+- [ ] Add metrics instrumentation
+
+---
+
+# Review Instructions
+
+Please review the code changes in this repository against the task requirements. Focus on:
+
+1. **Correctness**: Does the code correctly implement the task requirements?
+2. **Completeness**: Are all acceptance criteria met?
+3. **Code Quality**: Is the code clean, maintainable, and following best practices?
+4. **Error Handling**: Are errors handled appropriately?
+5. **Testing**: Are there adequate tests (if required)?
+6. **Security**: Are there any security vulnerabilities?
+7. **Performance**: Are there obvious performance issues?
+
+Provide your review in the following format:
+
+SEVERITY: [NONE|MINOR|MAJOR|CRITICAL]
+
+ISSUES:
+- [Issue description]
+- [Issue description]
+
+RECOMMENDATIONS:
+[Your detailed recommendations]
+
+If there are MAJOR or CRITICAL issues, list specific changes needed.
+If there are only MINOR issues or NO issues, approve the code.

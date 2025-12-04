@@ -64,6 +64,12 @@ func main() {
 }
 
 // setupRouter creates and configures the HTTP router
+// TODO: Replace net/http ServeMux with github.com/go-chi/chi/v5 router in the next task
+// The Chi router is already included as a dependency and will provide:
+// - Better routing with URL parameters
+// - Middleware composition
+// - Request context management
+// - Sub-router mounting
 func setupRouter() http.Handler {
 	mux := http.NewServeMux()
 
